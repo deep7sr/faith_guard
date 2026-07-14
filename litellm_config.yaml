@@ -1,0 +1,33 @@
+model_list:
+  - model_name: groq-llama-3.1-8b
+    litellm_params:
+      model: groq/llama-3.1-8b-instant
+      api_key: os.environ/GROQ_API_KEY
+
+  - model_name: judge-model
+    litellm_params:
+      model: groq/openai/gpt-oss-20b
+      api_key: os.environ/GROQ_API_KEY
+      reasoning_effort: "low"
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+
+guardrails:
+  # Independently selectable - infra attaches EITHER (or both) to a virtual
+  # key via /key/update: {"guardrails": ["faithfulness-metric-guard"]}
+  - guardrail_name: "faithfulness-metric-guard"
+    litellm_params:
+      guardrail: faithfulness_metric_guardrail.FaithfulnessMetricGuardrail
+      mode: "post_call"
+      default_on: false
+      threshold: 0.7
+      max_retries: 3
+
+  - guardrail_name: "geval-groundedness-guard"
+    litellm_params:
+      guardrail: geval_groundedness_guardrail.GEvalGroundednessGuardrail
+      mode: "post_call"
+      default_on: false
+      threshold: 0.7
+      max_retries: 3
