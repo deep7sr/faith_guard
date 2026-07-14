@@ -17,11 +17,19 @@ Two tiers, tried in order:
                      (including when they prefix an assistant-role message -
                      some teams inject context that way instead of via
                      system/user), etc. Deterministic. When it matches it's
-                     almost always right. For multi-turn conversations where
-                     more than one marker-prefixed assistant message exists,
-                     the MOST RECENT one is used - not all of them, and not
-                     the first - so a stale prior turn's context never leaks
-                     into scoring the current turn's answer.
+                     almost always right. The dash-header form additionally
+                     requires the label text itself to be evidence-flavored
+                     (see _is_evidence_label) so an unrelated dash-wrapped
+                     header in a real answer (e.g. "---Disclaimer---") isn't
+                     mistaken for injected context. For multi-turn
+                     conversations, a marker-prefixed assistant message is
+                     only trusted if it falls within the CURRENT turn's
+                     window - after the previous user question (if any) and
+                     before the current one (see _current_turn_window) - so a
+                     stale prior turn's context (e.g. turn 1 retrieved
+                     evidence, but turn 3 is an unrelated follow-up with no
+                     fresh retrieval) never leaks into scoring a later,
+                     unrelated turn's answer.
 
   Tier 2  LLM      - no marker found. Hand the messages to the judge model and
                      ask it to quote the question and context verbatim, then
@@ -141,6 +149,7 @@ _CONTEXT_OPENERS = [
     r"retrieved context",
     r"retrieved documents",
     r"retrieved chunks",
+    r"retrieved evidence",
     r"context documents",
     r"reference material",
     r"relevant documents",
@@ -149,6 +158,7 @@ _CONTEXT_OPENERS = [
     r"here are the retrieved",
     r"context",          # bare "Context:" label - broad, so it's LAST
     r"contexts",
+    r"evidence",         # bare "Evidence:" label - broad, so it's LAST too
 ]
 
 # Question openers, used to locate where context ends / query begins in the
@@ -202,10 +212,41 @@ def _xml_context_regex() -> re.Pattern:
 _XML_CONTEXT_RE = _xml_context_regex()
 
 # Dash-wrapped header pattern, e.g. "--- Retrieved Evidence ---",
-# "-----Context-----". Generic rather than tied to one exact phrase, since
-# different teams will word this differently while keeping the dash-wrapped
-# shape. Used only for the marker-prefixed-assistant-message check below.
-_DASH_HEADER_RE = re.compile(r"^\s*-{2,}\s*[A-Za-z][\w\s]{0,40}?\s*-{2,}")
+# "-----Context-----". The dash-wrapping itself is generic (different teams
+# word the label differently), but the LABEL TEXT is checked against
+# _EVIDENCE_LABEL_KEYWORDS below before it's trusted as context - otherwise
+# any short dash-wrapped header in a real answer (e.g. "---Disclaimer---")
+# would be misread as injected context. Used only for the
+# marker-prefixed-assistant-message check below.
+_DASH_HEADER_RE = re.compile(r"^\s*-{2,}\s*(?P<label>[A-Za-z][\w\s]{0,40}?)\s*-{2,}")
+
+# Keywords that make a dash-wrapped header's label evidence/context-flavored.
+# Checked as a substring, case-insensitive, against the captured label text -
+# e.g. "Retrieved Evidence" contains "retrieved evidence" and "evidence".
+# Bare "context"/"evidence" are intentionally included despite being broad,
+# matching the same tradeoff _CONTEXT_OPENERS makes for its bare "context".
+_EVIDENCE_LABEL_KEYWORDS = (
+    "retrieved evidence",
+    "retrieved context",
+    "retrieved document",
+    "retrieved chunk",
+    "retrieved passage",
+    "retrieved reference",
+    "retrieved source",
+    "reference material",
+    "knowledge base",
+    "context",
+    "evidence",
+    "document",
+    "passage",
+    "source",
+    "reference",
+)
+
+
+def _is_evidence_label(label: str) -> bool:
+    l = label.lower()
+    return any(kw in l for kw in _EVIDENCE_LABEL_KEYWORDS)
 
 # What a "question" looks like for the shape heuristic: a shortish line, usually
 # ending in '?' or starting with an interrogative/imperative.
@@ -265,15 +306,37 @@ def extract(
 # ---------------------------------------------------------------------------
 # Tier 1
 # ---------------------------------------------------------------------------
+def _current_turn_window(messages: List[dict]) -> List[dict]:
+    """Messages belonging to the CURRENT turn's preamble: everything after the
+    previous user question (if any) up to (exclusive of) the current/last user
+    question. Context injected for an EARLIER turn lives before that boundary
+    and must never be treated as if it were retrieved for the current turn -
+    e.g. if turn 1 injected evidence but turn 2 is an unrelated follow-up with
+    no fresh retrieval, turn 1's evidence must not leak into scoring turn 2's
+    answer."""
+    user_indices = [i for i, m in enumerate(messages) if m.get("role") == "user"]
+    if not user_indices:
+        return messages
+    last_user_idx = user_indices[-1]
+    window_start = user_indices[-2] + 1 if len(user_indices) >= 2 else 0
+    return messages[window_start:last_user_idx]
+
+
 def _last_marker_prefixed_assistant_context(messages: List[dict]) -> Optional[str]:
-    """Scan assistant-role messages for ones that START WITH a recognized
-    context marker (dash-wrapped header, or one of the standard opener
-    phrases). Returns the MOST RECENT match, not all matches and not the
-    first - a real generated answer never starts with these markers, so a
-    non-matching assistant message (real chat history) is correctly skipped
-    without resetting what was found so far."""
+    """Scan assistant-role messages IN THE CURRENT TURN'S WINDOW ONLY (see
+    _current_turn_window) for ones that START WITH a recognized context marker
+    (dash-wrapped header - gated by _is_evidence_label so an unrelated header
+    like "---Disclaimer---" isn't mistaken for context - or one of the
+    standard opener phrases). Returns the MOST RECENT match within that
+    window, not all matches and not the first - a real generated answer never
+    starts with these markers, so a non-matching assistant message (real chat
+    history for THIS turn, e.g. a prior corrective retry) is correctly skipped
+    without resetting what was found so far. Restricting to the current
+    turn's window (rather than the whole conversation) is what prevents a
+    stale marker-prefixed message from an earlier, unrelated turn being
+    reused as if it were fresh evidence for the current question."""
     last_match: Optional[str] = None
-    for msg in messages:
+    for msg in _current_turn_window(messages):
         if msg.get("role") != "assistant":
             continue
         content = _content_to_text(msg.get("content"))
@@ -281,7 +344,7 @@ def _last_marker_prefixed_assistant_context(messages: List[dict]) -> Optional[st
             continue
         stripped = content.lstrip()
         dash_match = _DASH_HEADER_RE.match(stripped)
-        if dash_match:
+        if dash_match and _is_evidence_label(dash_match.group("label")):
             last_match = stripped[dash_match.end():].strip()
             continue
         opener_match = _CONTEXT_OPENER_RE.match(stripped)
